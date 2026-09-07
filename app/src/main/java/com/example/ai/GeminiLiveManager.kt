@@ -40,14 +40,18 @@ class GeminiLiveManager(
 
     companion object {
         // Official Gemini Live native-audio model for real-time bidirectional voice
-        const val LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
-        private const val LIVE_WS_BASE_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
+        const val LIVE_MODEL = "models/gemini-3.1-flash-live-preview"
+        private const val LIVE_WS_BASE_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+        private const val CONNECTION_TIMEOUT_MS = 15000L
+        private const val MAX_RECONNECT_ATTEMPTS = 5
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + Job())
     private val sessionLock = Any()
     private var webSocket: WebSocket? = null
     private var isHandshakeComplete = false
+    private var isConnecting = false
+    private var connectionTimeoutJob: Job? = null
     private var reconnectJob: Job? = null
     private var reconnectAttempts = 0
     private var isUserExplicitlyStopped = false
@@ -132,28 +136,61 @@ class GeminiLiveManager(
                 MaxVoiceLogger.w("Cannot start Gemini Live session: API key is blank")
                 _assistantState.value = AssistantState.ERROR
                 _statusMessage.value = "Please configure Gemini API Key in Settings."
-                updateDebug(connection = "Missing API Key", err = "ERR_NO_API_KEY")
+                updateDebug(connection = "Missing API Key", state = "ERROR", err = "ERR_NO_API_KEY")
                 return
             }
 
-            // Close existing session before creating a new one
+            // Close existing session before creating a new one and cancel pending reconnection
             closeExistingWebSocket()
+            reconnectJob?.cancel()
+            reconnectJob = null
             isUserExplicitlyStopped = false
+            isConnecting = true
 
             _assistantState.value = AssistantState.CONNECTING
             _statusMessage.value = "Connecting to Gemini Live..."
             updateDebug(connection = "Connecting...", state = "CONNECTING")
 
-            MaxVoiceLogger.i("Connecting to Gemini Live API model: $LIVE_MODEL")
+            MaxVoiceLogger.i("Connecting to Gemini Live API: $LIVE_WS_BASE_URL with model: $LIVE_MODEL")
 
             val requestUrl = "$LIVE_WS_BASE_URL?key=$apiKey"
-            val request = Request.Builder().url(requestUrl).build()
+            val request = Request.Builder()
+                .url(requestUrl)
+                .addHeader("x-goog-api-key", apiKey)
+                .build()
 
-            webSocket = okHttpClient.newWebSocket(request, createWebSocketListener(onConnectedCallback))
+            // Connection timeout handling: if setupComplete is not received within timeout, trigger error
+            connectionTimeoutJob?.cancel()
+            connectionTimeoutJob = scope.launch {
+                delay(CONNECTION_TIMEOUT_MS)
+                synchronized(sessionLock) {
+                    if (!isHandshakeComplete && isConnecting) {
+                        MaxVoiceLogger.w("Gemini Live connection timed out after ${CONNECTION_TIMEOUT_MS}ms")
+                        closeExistingWebSocket()
+                        _assistantState.value = AssistantState.ERROR
+                        _statusMessage.value = "Connection timeout: Gemini Live server did not respond. Check network/API key."
+                        updateDebug(connection = "Timed Out", state = "ERROR", err = "ERR_CONNECTION_TIMEOUT")
+                    }
+                }
+            }
+
+            try {
+                webSocket = okHttpClient.newWebSocket(request, createWebSocketListener(onConnectedCallback))
+            } catch (e: Exception) {
+                MaxVoiceLogger.e("Exception creating WebSocket: ${e.message}", e)
+                connectionTimeoutJob?.cancel()
+                isConnecting = false
+                _assistantState.value = AssistantState.ERROR
+                _statusMessage.value = "Connection error: ${e.localizedMessage}"
+                updateDebug(connection = "Error", state = "ERROR", err = e.message)
+            }
         }
     }
 
     private fun closeExistingWebSocket() {
+        connectionTimeoutJob?.cancel()
+        connectionTimeoutJob = null
+        isConnecting = false
         try {
             webSocket?.close(1000, "Closing previous session")
         } catch (e: Exception) {
@@ -291,14 +328,11 @@ class GeminiLiveManager(
             val base64Data = Base64.encodeToString(pcmChunk, Base64.NO_WRAP)
             val msg = JSONObject().apply {
                 val realtimeInput = JSONObject().apply {
-                    val mediaChunks = JSONArray().apply {
-                        val chunk = JSONObject().apply {
-                            put("mimeType", "audio/pcm;rate=16000")
-                            put("data", base64Data)
-                        }
-                        put(chunk)
+                    val audioObj = JSONObject().apply {
+                        put("mimeType", "audio/pcm;rate=16000")
+                        put("data", base64Data)
                     }
-                    put("mediaChunks", mediaChunks)
+                    put("audio", audioObj)
                 }
                 put("realtimeInput", realtimeInput)
             }
@@ -310,62 +344,72 @@ class GeminiLiveManager(
 
     private fun sendSetupHandshake(ws: WebSocket) {
         MaxVoiceLogger.i("Sending Gemini Live setup handshake with model: $LIVE_MODEL")
-        val setupMsg = JSONObject().apply {
-            val setup = JSONObject().apply {
-                put("model", LIVE_MODEL)
+        try {
+            val setupMsg = JSONObject().apply {
+                val setup = JSONObject().apply {
+                    put("model", LIVE_MODEL)
 
-                val generationConfig = JSONObject().apply {
-                    val modalities = JSONArray().apply {
-                        put("AUDIO")
-                    }
-                    put("responseModalities", modalities)
+                    val generationConfig = JSONObject().apply {
+                        val modalities = JSONArray().apply {
+                            put("AUDIO")
+                        }
+                        put("responseModalities", modalities)
 
-                    val speechConfig = JSONObject().apply {
-                        val voiceConfig = JSONObject().apply {
-                            val prebuilt = JSONObject().apply {
-                                val voice = wallpaperThemeManager.selectedVoice.value.ifBlank { "Aoede" }
-                                put("voiceName", voice)
+                        val speechConfig = JSONObject().apply {
+                            val voiceConfig = JSONObject().apply {
+                                val prebuilt = JSONObject().apply {
+                                    val savedVoice = wallpaperThemeManager.selectedVoice.value
+                                    val validVoices = setOf("Aoede", "Charon", "Fenrir", "Kore", "Puck")
+                                    val voice = if (savedVoice in validVoices) savedVoice else "Aoede"
+                                    put("voiceName", voice)
+                                }
+                                put("prebuiltVoiceConfig", prebuilt)
                             }
-                            put("prebuiltVoiceConfig", prebuilt)
+                            put("voiceConfig", voiceConfig)
                         }
-                        put("voiceConfig", voiceConfig)
+                        put("speechConfig", speechConfig)
                     }
-                    put("speechConfig", speechConfig)
-                }
-                put("generationConfig", generationConfig)
+                    put("generationConfig", generationConfig)
 
-                val systemInstruction = JSONObject().apply {
-                    val parts = JSONArray().apply {
-                        val part = JSONObject().apply {
-                            val activePersonality = wallpaperThemeManager.personality.value
-                            put("text", ToolDefinitions.buildSystemInstruction(activePersonality))
+                    val systemInstruction = JSONObject().apply {
+                        val parts = JSONArray().apply {
+                            val part = JSONObject().apply {
+                                val activePersonality = wallpaperThemeManager.personality.value
+                                put("text", ToolDefinitions.buildSystemInstruction(activePersonality))
+                            }
+                            put(part)
                         }
-                        put(part)
+                        put("parts", parts)
                     }
-                    put("parts", parts)
-                }
-                put("systemInstruction", systemInstruction)
+                    put("systemInstruction", systemInstruction)
 
-                val toolsArray = JSONArray().apply {
-                    val toolDecl = JSONObject().apply {
-                        put("functionDeclarations", ToolDefinitions.getGeminiToolDeclarations())
+                    val toolsArray = JSONArray().apply {
+                        val toolDecl = JSONObject().apply {
+                            put("functionDeclarations", ToolDefinitions.getGeminiToolDeclarations())
+                        }
+                        put(toolDecl)
                     }
-                    put(toolDecl)
+                    put("tools", toolsArray)
                 }
-                put("tools", toolsArray)
+                put("setup", setup)
             }
-            put("setup", setup)
-        }
 
-        ws.send(setupMsg.toString())
+            ws.send(setupMsg.toString())
+            MaxVoiceLogger.i("Setup handshake message sent successfully")
+        } catch (e: Exception) {
+            MaxVoiceLogger.e("Failed to construct or send setup handshake: ${e.message}", e)
+            _assistantState.value = AssistantState.ERROR
+            _statusMessage.value = "Setup failed: ${e.localizedMessage}"
+            updateDebug(state = "ERROR", err = "Setup failed: ${e.message}")
+        }
     }
 
     private fun createWebSocketListener(onConnectedCallback: (() -> Unit)?): WebSocketListener {
         return object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 reconnectAttempts = 0
-                MaxVoiceLogger.i("Gemini Live WebSocket opened successfully")
-                updateDebug(connection = "Connected (Gemini Live)")
+                MaxVoiceLogger.i("Gemini Live WebSocket opened successfully (HTTP ${response.code})")
+                updateDebug(connection = "WebSocket Open (Sending Setup)")
                 sendSetupHandshake(webSocket)
             }
 
@@ -376,27 +420,67 @@ class GeminiLiveManager(
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                MaxVoiceLogger.d("WebSocket closing: $code / $reason")
+                MaxVoiceLogger.d("WebSocket closing: code=$code, reason='$reason'")
                 webSocket.close(1000, null)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                MaxVoiceLogger.i("WebSocket closed: $code / $reason")
+                MaxVoiceLogger.i("WebSocket closed: code=$code, reason='$reason'")
+                connectionTimeoutJob?.cancel()
+                isConnecting = false
                 this@GeminiLiveManager.webSocket = null
                 isHandshakeComplete = false
-                updateDebug(connection = "Closed ($reason)")
+
+                updateDebug(connection = "Closed ($code: $reason)")
                 if (!isUserExplicitlyStopped && _assistantState.value != AssistantState.IDLE) {
-                    scheduleReconnect()
+                    if (code != 1000) {
+                        _assistantState.value = AssistantState.ERROR
+                        _statusMessage.value = if (reason.isNotBlank()) "Disconnected: $reason" else "Disconnected from Gemini Live ($code)"
+                        scheduleReconnect()
+                    } else {
+                        _assistantState.value = AssistantState.IDLE
+                        _statusMessage.value = "MAX is ready. Tap orb to speak."
+                    }
                 }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                MaxVoiceLogger.e("WebSocket failure: ${t.message}", t)
+                connectionTimeoutJob?.cancel()
+                isConnecting = false
                 this@GeminiLiveManager.webSocket = null
                 isHandshakeComplete = false
-                val err = t.localizedMessage ?: "Connection error"
-                updateDebug(connection = "Failed", err = err)
-                if (!isUserExplicitlyStopped) {
+
+                val httpCode = response?.code
+                val responseBody = try {
+                    response?.body?.string()
+                } catch (e: Exception) {
+                    null
+                }
+
+                val fullErrorLog = buildString {
+                    append(t.message ?: "Connection failure")
+                    if (httpCode != null) append(" (HTTP $httpCode)")
+                    if (!responseBody.isNullOrBlank()) append(" - Response: $responseBody")
+                }
+                MaxVoiceLogger.e("WebSocket failure: $fullErrorLog", t)
+
+                val userErrorMessage = when {
+                    httpCode == 400 -> "Connection failed (400 Bad Request): Verify Gemini Live API schema and settings."
+                    httpCode == 401 || httpCode == 403 -> "Gemini API key rejected ($httpCode). Please check your key in Settings."
+                    httpCode == 404 -> "Gemini Live model not found ($httpCode). Endpoint: $LIVE_MODEL"
+                    httpCode != null -> "Gemini Live connection error (HTTP $httpCode): ${t.message ?: "Failed to connect"}"
+                    t is java.net.UnknownHostException -> "No internet connection. Please check network."
+                    t is java.net.SocketTimeoutException -> "Connection timed out connecting to Gemini Live."
+                    else -> "Connection error: ${t.localizedMessage ?: "Failed to connect to Gemini Live"}"
+                }
+
+                _assistantState.value = AssistantState.ERROR
+                _statusMessage.value = userErrorMessage
+                updateDebug(connection = "Failed (${httpCode ?: "ERR"})", state = "ERROR", err = fullErrorLog)
+
+                // Only reconnect for network or transient errors, not for fatal auth/bad-request errors
+                val isFatalError = httpCode in listOf(400, 401, 403, 404)
+                if (!isUserExplicitlyStopped && !isFatalError) {
                     scheduleReconnect()
                 }
             }
@@ -407,13 +491,41 @@ class GeminiLiveManager(
         try {
             val json = JSONObject(jsonText)
 
+            // 0. Check for error from Gemini Live server
+            if (json.has("error")) {
+                connectionTimeoutJob?.cancel()
+                isConnecting = false
+                val errorObj = json.optJSONObject("error")
+                val errorCode = errorObj?.optInt("code") ?: 0
+                val errorMessage = errorObj?.optString("message") ?: json.optString("error")
+                val errorStatus = errorObj?.optString("status") ?: ""
+                val fullError = "Gemini Live Error ($errorCode $errorStatus): $errorMessage"
+                MaxVoiceLogger.e(fullError)
+
+                withContext(Dispatchers.Main) {
+                    _assistantState.value = AssistantState.ERROR
+                    _statusMessage.value = errorMessage.ifBlank { "Gemini Live Error ($errorCode)" }
+                    updateDebug(connection = "Error", state = "ERROR", err = fullError)
+                }
+                return
+            }
+
             // 1. Check for setupComplete
             if (json.has("setupComplete")) {
+                connectionTimeoutJob?.cancel()
+                isConnecting = false
                 isHandshakeComplete = true
                 MaxVoiceLogger.i("Gemini Live setupComplete handshake received. Session is LIVE.")
                 withContext(Dispatchers.Main) {
                     updateDebug(connection = "Live Ready")
-                    onConnectedCallback?.invoke()
+                    if (onConnectedCallback != null) {
+                        onConnectedCallback.invoke()
+                    } else {
+                        if (_assistantState.value == AssistantState.CONNECTING) {
+                            _assistantState.value = AssistantState.IDLE
+                            _statusMessage.value = "Connected to Gemini Live. Tap orb to speak."
+                        }
+                    }
                 }
                 return
             }
@@ -423,8 +535,10 @@ class GeminiLiveManager(
                 val toolCallObj = json.getJSONObject("toolCall")
                 val functionCalls = toolCallObj.optJSONArray("functionCalls")
                 if (functionCalls != null && functionCalls.length() > 0) {
-                    _assistantState.value = AssistantState.THINKING
-                    _statusMessage.value = "Executing action..."
+                    withContext(Dispatchers.Main) {
+                        _assistantState.value = AssistantState.THINKING
+                        _statusMessage.value = "Executing action..."
+                    }
                     for (i in 0 until functionCalls.length()) {
                         val call = functionCalls.getJSONObject(i)
                         val callId = call.optString("id", java.util.UUID.randomUUID().toString())
@@ -438,14 +552,14 @@ class GeminiLiveManager(
                             argsMap[k] = argsJson.get(k)
                         }
 
-                        MaxVoiceLogger.i("Tool call received from Gemini Live: $name")
+                        MaxVoiceLogger.i("Tool call received from Gemini Live: $name (callId: $callId)")
                         updateDebug(lastTool = name)
 
                         val toolCall = ToolCall(callId, name, argsMap)
                         val result = toolExecutionEngine.executeTool(toolCall)
 
                         updateDebug(lastResult = "${result.name}: ${result.message}")
-                        sendToolResponse(callId, result.message)
+                        sendToolResponse(callId, name, result.message)
 
                         withContext(Dispatchers.Main) {
                             _statusMessage.value = result.message
@@ -481,7 +595,13 @@ class GeminiLiveManager(
                                 val base64 = inlineData.getString("data")
                                 val audioBytes = Base64.decode(base64, Base64.DEFAULT)
 
-                                _assistantState.value = AssistantState.SPEAKING
+                                withContext(Dispatchers.Main) {
+                                    _assistantState.value = AssistantState.SPEAKING
+                                    val isGf = wallpaperThemeManager.personality.value == AssistantPersonality.GIRLFRIEND_MODE
+                                    if (_statusMessage.value.startsWith("Listening") || _statusMessage.value.startsWith("Processing") || _statusMessage.value.startsWith("Haan babu")) {
+                                        _statusMessage.value = if (isGf) "MAX bol rahi hai... ❤️" else "MAX speaking..."
+                                    }
+                                }
                                 updateDebug(state = "SPEAKING", audio = "Playing response")
                                 audioOutputManager.enqueueAudio(audioBytes)
                             }
@@ -492,10 +612,12 @@ class GeminiLiveManager(
                 if (serverContent.optBoolean("turnComplete", false)) {
                     delay(400)
                     if (!audioOutputManager.isPlaying.value && _assistantState.value == AssistantState.SPEAKING) {
-                        _assistantState.value = AssistantState.IDLE
-                        val isGf = wallpaperThemeManager.personality.value == AssistantPersonality.GIRLFRIEND_MODE
-                        _statusMessage.value = if (isGf) "Aapke saath hoon babu... ❤️" else "Tap orb to speak"
-                        updateDebug(state = "IDLE")
+                        withContext(Dispatchers.Main) {
+                            _assistantState.value = AssistantState.IDLE
+                            val isGf = wallpaperThemeManager.personality.value == AssistantPersonality.GIRLFRIEND_MODE
+                            _statusMessage.value = if (isGf) "Aapke saath hoon babu... ❤️" else "Tap orb to speak"
+                            updateDebug(state = "IDLE")
+                        }
                     }
                 }
             }
@@ -505,14 +627,15 @@ class GeminiLiveManager(
         }
     }
 
-    private fun sendToolResponse(callId: String, resultText: String) {
+    private fun sendToolResponse(callId: String, name: String, resultText: String) {
         val ws = webSocket ?: return
         try {
             val toolResponseMsg = JSONObject().apply {
                 val toolResponse = JSONObject().apply {
                     val functionResponses = JSONArray().apply {
                         val resp = JSONObject().apply {
-                            put("id", callId)
+                            if (callId.isNotBlank()) put("id", callId)
+                            if (name.isNotBlank()) put("name", name)
                             val responseContent = JSONObject().apply {
                                 val output = JSONObject().apply {
                                     put("result", resultText)
@@ -528,7 +651,7 @@ class GeminiLiveManager(
                 put("toolResponse", toolResponse)
             }
             ws.send(toolResponseMsg.toString())
-            MaxVoiceLogger.d("Tool response sent for callId: $callId")
+            MaxVoiceLogger.d("Tool response sent for callId: $callId, name: $name")
         } catch (e: Exception) {
             MaxVoiceLogger.e("Failed to send tool response: ${e.message}", e)
         }
@@ -540,11 +663,11 @@ class GeminiLiveManager(
     private fun scheduleReconnect() {
         if (isUserExplicitlyStopped) return
 
-        if (reconnectAttempts >= 5) {
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
             _assistantState.value = AssistantState.OFFLINE
             _statusMessage.value = "Connection lost. Tap Orb to reconnect."
             updateDebug(state = "OFFLINE", connection = "Max retries reached")
-            MaxVoiceLogger.w("Max reconnection attempts (5) reached")
+            MaxVoiceLogger.w("Max reconnection attempts ($MAX_RECONNECT_ATTEMPTS) reached")
             return
         }
 
@@ -552,8 +675,7 @@ class GeminiLiveManager(
         reconnectJob = scope.launch {
             val backoffMs = (1000L * (1 shl reconnectAttempts)).coerceAtMost(16000L)
             reconnectAttempts++
-            _assistantState.value = AssistantState.CONNECTING
-            _statusMessage.value = "Reconnecting (${backoffMs / 1000}s)..."
+            _statusMessage.value = "Reconnecting in ${backoffMs / 1000}s (Attempt $reconnectAttempts)..."
             updateDebug(connection = "Backoff ${backoffMs / 1000}s (Attempt $reconnectAttempts)")
             MaxVoiceLogger.i("Scheduling reconnect in ${backoffMs}ms (Attempt $reconnectAttempts)")
             delay(backoffMs)
