@@ -1,0 +1,6 @@
+{
+  "name": "MAX Assistant",
+  "description": "Production-ready native Android voice assistant powered by Gemini Live with real-time tool execution, local wake-word, and voice-first futuristic UI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
