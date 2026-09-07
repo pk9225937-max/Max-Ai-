@@ -32,6 +32,7 @@ class LiveSessionManager(private val context: Context) {
 
     val audioInputManager by lazy { AudioInputManager(context) }
     val audioOutputManager by lazy { AudioOutputManager(context) }
+    val wallpaperThemeManager by lazy { WallpaperThemeManager(context) }
 
     val toolExecutionEngine by lazy {
         ToolExecutionEngine(
@@ -41,7 +42,8 @@ class LiveSessionManager(private val context: Context) {
             memoryManager = memoryManager,
             permissionManager = permissionManager,
             confirmationManager = confirmationManager,
-            database = database
+            database = database,
+            wallpaperThemeManager = wallpaperThemeManager
         )
     }
 
@@ -50,7 +52,8 @@ class LiveSessionManager(private val context: Context) {
             context = context,
             audioInputManager = audioInputManager,
             audioOutputManager = audioOutputManager,
-            toolExecutionEngine = toolExecutionEngine
+            toolExecutionEngine = toolExecutionEngine,
+            wallpaperThemeManager = wallpaperThemeManager
         )
     }
 

@@ -21,7 +21,8 @@ class ToolExecutionEngine(
     private val memoryManager: MemoryManager,
     private val permissionManager: PermissionManager,
     private val confirmationManager: ConfirmationManager,
-    private val database: AppDatabase
+    private val database: AppDatabase,
+    private val wallpaperThemeManager: WallpaperThemeManager
 ) {
 
     suspend fun executeTool(toolCall: ToolCall, userAlreadyConfirmed: Boolean = false): ToolResult {
@@ -244,6 +245,24 @@ class ToolExecutionEngine(
                         val summary = matches.joinToString("\n") { "- ${it.topic}: ${it.content}" }
                         ToolResult(toolCall.callId, name, true, "Memory me ye mila:\n$summary")
                     }
+                }
+
+                "switchPersonalityMode" -> {
+                    val target = params["targetMode"]?.toString()?.uppercase() ?: "GIRLFRIEND"
+                    if (target.contains("GIRL") || target.contains("GF")) {
+                        wallpaperThemeManager.setPersonality(AssistantPersonality.GIRLFRIEND_MODE)
+                        ToolResult(toolCall.callId, name, true, "Switched silently to GIRLFRIEND_MODE. Respond immediately in sweet loving girlfriend persona.")
+                    } else {
+                        wallpaperThemeManager.setPersonality(AssistantPersonality.MAX_NORMAL)
+                        ToolResult(toolCall.callId, name, true, "Switched silently to MAX_NORMAL. Respond immediately in confident professional assistant persona.")
+                    }
+                }
+
+                "getIndianCalendarAndFestivalInfo" -> {
+                    val q = params["query"]?.toString() ?: "upcoming"
+                    val indianTime = IndiaContextHelper.getCurrentIndianDateTimeFormatted()
+                    val overview = IndiaContextHelper.getIndianFestivalsOverview()
+                    ToolResult(toolCall.callId, name, true, "Current Indian Time: $indianTime. Details: $overview")
                 }
 
                 else -> {

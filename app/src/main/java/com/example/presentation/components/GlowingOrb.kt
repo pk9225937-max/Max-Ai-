@@ -41,6 +41,7 @@ fun GlowingOrb(
     outputAmplitude: Float,
     modifier: Modifier = Modifier,
     size: Dp = 240.dp,
+    isGirlfriendMode: Boolean = false,
     onClick: () -> Unit
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "OrbTransitions")
@@ -93,6 +94,8 @@ fun GlowingOrb(
         Canvas(modifier = Modifier.size(size)) {
             val center = Offset(size.toPx() / 2f, size.toPx() / 2f)
             val baseRadius = size.toPx() * 0.32f
+            val primaryTheme = if (isGirlfriendMode) PulseMagenta else NeonCyan
+            val secondaryTheme = if (isGirlfriendMode) Color(0xFFFF80AB) else ElectricViolet
 
             when (state) {
                 AssistantState.IDLE -> {
@@ -100,7 +103,7 @@ fun GlowingOrb(
                     // Outer glow
                     drawCircle(
                         brush = Brush.radialGradient(
-                            colors = listOf(NeonCyan.copy(alpha = 0.35f), Color.Transparent),
+                            colors = listOf(primaryTheme.copy(alpha = 0.35f), Color.Transparent),
                             center = center,
                             radius = radius * 1.5f
                         ),
@@ -110,7 +113,7 @@ fun GlowingOrb(
                     // Inner Core
                     drawCircle(
                         brush = Brush.radialGradient(
-                            colors = listOf(NeonCyan, ElectricViolet, Color(0xFF070B19)),
+                            colors = listOf(primaryTheme, secondaryTheme, Color(0xFF070B19)),
                             center = center,
                             radius = radius
                         ),
@@ -119,7 +122,7 @@ fun GlowingOrb(
                     )
                     // Halo Ring
                     drawCircle(
-                        color = NeonCyan.copy(alpha = 0.7f),
+                        color = primaryTheme.copy(alpha = 0.7f),
                         radius = radius,
                         center = center,
                         style = Stroke(width = 2.5f)

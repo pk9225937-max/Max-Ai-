@@ -23,6 +23,10 @@ class BackgroundAudioService : Service() {
         const val ACTION_START = "com.example.service.START"
         const val ACTION_STOP = "com.example.service.STOP"
 
+        @Volatile
+        var isServiceRunning: Boolean = false
+            private set
+
         fun startService(context: Context) {
             val intent = Intent(context, BackgroundAudioService::class.java).apply {
                 action = ACTION_START
@@ -39,6 +43,7 @@ class BackgroundAudioService : Service() {
                 action = ACTION_STOP
             }
             context.stopService(intent)
+            isServiceRunning = false
         }
     }
 
@@ -63,6 +68,7 @@ class BackgroundAudioService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_START, null -> {
+                isServiceRunning = true
                 val notification = buildForegroundNotification()
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -89,6 +95,7 @@ class BackgroundAudioService : Service() {
     }
 
     override fun onDestroy() {
+        isServiceRunning = false
         sessionManager?.release()
         sessionManager = null
         super.onDestroy()

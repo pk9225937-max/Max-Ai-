@@ -34,7 +34,8 @@ class GeminiLiveManager(
     private val context: Context,
     private val audioInputManager: AudioInputManager,
     private val audioOutputManager: AudioOutputManager,
-    private val toolExecutionEngine: ToolExecutionEngine
+    private val toolExecutionEngine: ToolExecutionEngine,
+    val wallpaperThemeManager: WallpaperThemeManager
 ) {
 
     companion object {
@@ -70,17 +71,53 @@ class GeminiLiveManager(
         audioOutputManager.initPlayer(scope)
     }
 
-    fun isApiKeyConfigured(): Boolean {
+    private val prefs = context.getSharedPreferences("max_assistant_prefs", Context.MODE_PRIVATE)
+
+    fun getApiKey(): String {
+        val customKey = prefs.getString("custom_gemini_api_key", "")?.trim() ?: ""
+        if (customKey.isNotBlank()) {
+            return customKey
+        }
         return try {
-            val key = BuildConfig.GEMINI_API_KEY
-            key.isNotBlank() && key != "MY_GEMINI_API_KEY"
+            val buildKey = BuildConfig.GEMINI_API_KEY.trim()
+            if (buildKey.isNotBlank() && buildKey != "MY_GEMINI_API_KEY") buildKey else ""
         } catch (e: Throwable) {
-            false
+            ""
+        }
+    }
+
+    fun isApiKeyConfigured(): Boolean {
+        return getApiKey().isNotBlank()
+    }
+
+    fun saveCustomApiKey(key: String) {
+        val trimmed = key.trim()
+        prefs.edit().putString("custom_gemini_api_key", trimmed).apply()
+        if (trimmed.isNotBlank()) {
+            if (_assistantState.value == AssistantState.ERROR) {
+                _assistantState.value = AssistantState.IDLE
+                _statusMessage.value = "MAX is ready. Tap orb or say 'MAX'."
+                updateDebug(connection = "Configured", state = "IDLE", err = "")
+            }
+        }
+    }
+
+    fun getCustomApiKey(): String {
+        return prefs.getString("custom_gemini_api_key", "")?.trim() ?: ""
+    }
+
+    fun clearCustomApiKey() {
+        prefs.edit().remove("custom_gemini_api_key").apply()
+        if (!isApiKeyConfigured()) {
+            _assistantState.value = AssistantState.ERROR
+            _statusMessage.value = "Gemini connection configuration is missing."
+            updateDebug(connection = "Config missing", state = "ERROR", err = "ERR_NO_API_KEY")
         }
     }
 
     fun startSession() {
-        if (!isApiKeyConfigured()) {
+        val apiKey = getApiKey()
+        if (apiKey.isBlank()) {
             _assistantState.value = AssistantState.ERROR
             _statusMessage.value = "Gemini connection configuration is missing."
             updateDebug(connection = "Config missing", err = "ERR_NO_API_KEY")
@@ -93,7 +130,6 @@ class GeminiLiveManager(
         _statusMessage.value = "Connecting to MAX Core..."
         updateDebug(connection = "Connecting...", state = "CONNECTING")
 
-        val apiKey = BuildConfig.GEMINI_API_KEY
         val requestUrl = "$LIVE_WS_URL?key=$apiKey"
         val request = Request.Builder().url(requestUrl).build()
 
@@ -196,7 +232,8 @@ class GeminiLiveManager(
                     val speechConfig = JSONObject().apply {
                         val voiceConfig = JSONObject().apply {
                             val prebuilt = JSONObject().apply {
-                                put("voiceName", "Aoede")
+                                val voice = wallpaperThemeManager.selectedVoice.value.ifBlank { "Aoede" }
+                                put("voiceName", voice)
                             }
                             put("prebuiltVoiceConfig", prebuilt)
                         }
@@ -209,7 +246,8 @@ class GeminiLiveManager(
                 val systemInstruction = JSONObject().apply {
                     val parts = JSONArray().apply {
                         val part = JSONObject().apply {
-                            put("text", ToolDefinitions.SYSTEM_INSTRUCTION)
+                            val activePersonality = wallpaperThemeManager.personality.value
+                            put("text", ToolDefinitions.buildSystemInstruction(activePersonality))
                         }
                         put(part)
                     }
