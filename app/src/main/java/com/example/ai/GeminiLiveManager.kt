@@ -5,6 +5,7 @@ import android.util.Base64
 import com.example.BuildConfig
 import com.example.audio.AudioInputManager
 import com.example.audio.AudioOutputManager
+import com.example.audio.MaxVoiceLogger
 import com.example.domain.model.AssistantState
 import com.example.domain.model.LiveDebugInfo
 import com.example.domain.model.ToolCall
@@ -18,7 +19,6 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -39,19 +39,23 @@ class GeminiLiveManager(
 ) {
 
     companion object {
-        private const val LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
-        private const val LIVE_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
+        // Official Gemini Live native-audio model for real-time bidirectional voice
+        const val LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+        private const val LIVE_WS_BASE_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + Job())
+    private val sessionLock = Any()
     private var webSocket: WebSocket? = null
+    private var isHandshakeComplete = false
     private var reconnectJob: Job? = null
     private var reconnectAttempts = 0
+    private var isUserExplicitlyStopped = false
 
     private val _assistantState = MutableStateFlow(AssistantState.IDLE)
     val assistantState: StateFlow<AssistantState> = _assistantState.asStateFlow()
 
-    private val _statusMessage = MutableStateFlow("Tap the Orb or say 'MAX'")
+    private val _statusMessage = MutableStateFlow("Tap the Orb to speak")
     val statusMessage: StateFlow<String> = _statusMessage.asStateFlow()
 
     private val _transcriptFlow = MutableSharedFlow<String>(extraBufferCapacity = 64)
@@ -67,11 +71,11 @@ class GeminiLiveManager(
         .pingInterval(10, TimeUnit.SECONDS)
         .build()
 
+    private val prefs = context.getSharedPreferences("max_assistant_prefs", Context.MODE_PRIVATE)
+
     init {
         audioOutputManager.initPlayer(scope)
     }
-
-    private val prefs = context.getSharedPreferences("max_assistant_prefs", Context.MODE_PRIVATE)
 
     fun getApiKey(): String {
         val customKey = prefs.getString("custom_gemini_api_key", "")?.trim() ?: ""
@@ -93,10 +97,11 @@ class GeminiLiveManager(
     fun saveCustomApiKey(key: String) {
         val trimmed = key.trim()
         prefs.edit().putString("custom_gemini_api_key", trimmed).apply()
+        MaxVoiceLogger.i("Custom Gemini API key saved by user")
         if (trimmed.isNotBlank()) {
             if (_assistantState.value == AssistantState.ERROR) {
                 _assistantState.value = AssistantState.IDLE
-                _statusMessage.value = "MAX is ready. Tap orb or say 'MAX'."
+                _statusMessage.value = "MAX is ready. Tap orb to speak."
                 updateDebug(connection = "Configured", state = "IDLE", err = "")
             }
         }
@@ -108,35 +113,59 @@ class GeminiLiveManager(
 
     fun clearCustomApiKey() {
         prefs.edit().remove("custom_gemini_api_key").apply()
+        MaxVoiceLogger.i("Custom Gemini API key cleared")
         if (!isApiKeyConfigured()) {
             _assistantState.value = AssistantState.ERROR
-            _statusMessage.value = "Gemini connection configuration is missing."
+            _statusMessage.value = "Gemini API key is missing. Please configure in Settings."
             updateDebug(connection = "Config missing", state = "ERROR", err = "ERR_NO_API_KEY")
         }
     }
 
-    fun startSession() {
-        val apiKey = getApiKey()
-        if (apiKey.isBlank()) {
-            _assistantState.value = AssistantState.ERROR
-            _statusMessage.value = "Gemini connection configuration is missing."
-            updateDebug(connection = "Config missing", err = "ERR_NO_API_KEY")
-            return
+    /**
+     * Connects bidirectional WebSocket session to Gemini Live API.
+     * Prevents multiple concurrent sessions (Requirement 14).
+     */
+    fun startSession(onConnectedCallback: (() -> Unit)? = null) {
+        synchronized(sessionLock) {
+            val apiKey = getApiKey()
+            if (apiKey.isBlank()) {
+                MaxVoiceLogger.w("Cannot start Gemini Live session: API key is blank")
+                _assistantState.value = AssistantState.ERROR
+                _statusMessage.value = "Please configure Gemini API Key in Settings."
+                updateDebug(connection = "Missing API Key", err = "ERR_NO_API_KEY")
+                return
+            }
+
+            // Close existing session before creating a new one
+            closeExistingWebSocket()
+            isUserExplicitlyStopped = false
+
+            _assistantState.value = AssistantState.CONNECTING
+            _statusMessage.value = "Connecting to Gemini Live..."
+            updateDebug(connection = "Connecting...", state = "CONNECTING")
+
+            MaxVoiceLogger.i("Connecting to Gemini Live API model: $LIVE_MODEL")
+
+            val requestUrl = "$LIVE_WS_BASE_URL?key=$apiKey"
+            val request = Request.Builder().url(requestUrl).build()
+
+            webSocket = okHttpClient.newWebSocket(request, createWebSocketListener(onConnectedCallback))
         }
+    }
 
-        if (webSocket != null) return
-
-        _assistantState.value = AssistantState.CONNECTING
-        _statusMessage.value = "Connecting to MAX Core..."
-        updateDebug(connection = "Connecting...", state = "CONNECTING")
-
-        val requestUrl = "$LIVE_WS_URL?key=$apiKey"
-        val request = Request.Builder().url(requestUrl).build()
-
-        webSocket = okHttpClient.newWebSocket(request, createWebSocketListener())
+    private fun closeExistingWebSocket() {
+        try {
+            webSocket?.close(1000, "Closing previous session")
+        } catch (e: Exception) {
+            // Ignored
+        } finally {
+            webSocket = null
+            isHandshakeComplete = false
+        }
     }
 
     fun stopSession() {
+        isUserExplicitlyStopped = true
         reconnectJob?.cancel()
         reconnectJob = null
         reconnectAttempts = 0
@@ -144,12 +173,14 @@ class GeminiLiveManager(
         audioInputManager.stopRecording()
         audioOutputManager.stopPlayback()
 
-        webSocket?.close(1000, "User stopped session")
-        webSocket = null
+        synchronized(sessionLock) {
+            closeExistingWebSocket()
+        }
 
         _assistantState.value = AssistantState.IDLE
-        _statusMessage.value = "MAX is ready. Tap orb or say 'MAX'."
+        _statusMessage.value = "MAX is ready. Tap orb to speak."
         updateDebug(connection = "Disconnected", state = "IDLE", audio = "Idle")
+        MaxVoiceLogger.i("Gemini Live session stopped by user")
     }
 
     fun toggleVoiceInteraction() {
@@ -160,65 +191,125 @@ class GeminiLiveManager(
         }
     }
 
+    /**
+     * Requirement 4 & 11:
+     * Validates API key, microphone permission and hardware BEFORE entering LISTENING state.
+     * Starts AudioRecord capture and only enters LISTENING when recording actually starts.
+     */
     fun activateListening() {
         if (!isApiKeyConfigured()) {
             _assistantState.value = AssistantState.ERROR
-            _statusMessage.value = "Gemini connection configuration is missing."
+            _statusMessage.value = "Please configure your Gemini API Key in Settings."
+            MaxVoiceLogger.w("activateListening aborted: API key not configured")
+            return
+        }
+
+        if (!audioInputManager.hasMicrophonePermission()) {
+            _assistantState.value = AssistantState.ERROR
+            _statusMessage.value = "Microphone unavailable. Please check microphone permission and make sure another app is not using the microphone."
+            MaxVoiceLogger.w("activateListening aborted: RECORD_AUDIO permission not granted")
+            return
+        }
+
+        if (!audioInputManager.hasMicrophoneHardware()) {
+            _assistantState.value = AssistantState.ERROR
+            _statusMessage.value = "Microphone hardware is not available on this device."
+            MaxVoiceLogger.e("activateListening aborted: No mic hardware")
             return
         }
 
         audioOutputManager.stopPlayback()
 
-        if (webSocket == null) {
-            startSession()
+        // Ensure WebSocket session is active
+        if (webSocket == null || !isHandshakeComplete) {
+            _assistantState.value = AssistantState.CONNECTING
+            _statusMessage.value = "Connecting to MAX Core..."
+            startSession {
+                startMicrophoneCapture()
+            }
+        } else {
+            startMicrophoneCapture()
         }
+    }
 
-        _assistantState.value = AssistantState.LISTENING
-        _statusMessage.value = "Listening... Bolिये boss!"
-        updateDebug(state = "LISTENING", audio = "Microphone Active")
-
+    private fun startMicrophoneCapture() {
         audioInputManager.startRecording(
             scope = scope,
+            isOutputPlaying = { audioOutputManager.isPlaying.value },
+            onInterruption = {
+                handleUserBargeIn()
+            },
             onAudioChunk = { pcmChunk ->
                 sendAudioChunk(pcmChunk)
+            },
+            onStarted = {
+                // Requirement 11: Only set LISTENING once AudioRecord has successfully started!
+                _assistantState.value = AssistantState.LISTENING
+                val isGf = wallpaperThemeManager.personality.value == AssistantPersonality.GIRLFRIEND_MODE
+                _statusMessage.value = if (isGf) "Haan babu bolo, sun rahi hoon... ❤️" else "Listening... Go ahead!"
+                updateDebug(state = "LISTENING", audio = "Microphone Active")
+                MaxVoiceLogger.i("Microphone capture active. Assistant state -> LISTENING")
             },
             onError = { errMsg ->
                 _assistantState.value = AssistantState.ERROR
                 _statusMessage.value = errMsg
                 updateDebug(state = "ERROR", audio = "Mic Error", err = errMsg)
+                MaxVoiceLogger.e("AudioRecord start failed: $errMsg")
             }
         )
+    }
+
+    /**
+     * Requirement 9: Barge-in interruption handler.
+     * When user speaks while MAX is speaking, immediately cut off playback,
+     * flush the audio buffer, and return to LISTENING state.
+     */
+    private fun handleUserBargeIn() {
+        MaxVoiceLogger.i("Handling user barge-in interruption: stopping playback immediately")
+        audioOutputManager.stopPlayback()
+        _assistantState.value = AssistantState.LISTENING
+        updateDebug(state = "LISTENING", audio = "User Interrupted -> Listening")
     }
 
     fun stopListeningToUser() {
         audioInputManager.stopRecording()
         if (_assistantState.value == AssistantState.LISTENING) {
             _assistantState.value = AssistantState.THINKING
-            _statusMessage.value = "MAX thinking..."
-            updateDebug(state = "THINKING", audio = "Processing")
+            _statusMessage.value = "Processing..."
+            updateDebug(state = "THINKING", audio = "Idle")
         }
     }
 
+    /**
+     * Requirement 6 & 7: Sends PCM audio continuously to Gemini Live API in real-time.
+     */
     private fun sendAudioChunk(pcmChunk: ByteArray) {
         val ws = webSocket ?: return
-        val base64 = Base64.encodeToString(pcmChunk, Base64.NO_WRAP)
-        val msg = JSONObject().apply {
-            val realtimeInput = JSONObject().apply {
-                val mediaChunks = JSONArray().apply {
-                    val chunk = JSONObject().apply {
-                        put("mimeType", "audio/pcm;rate=16000")
-                        put("data", base64)
+        if (!isHandshakeComplete) return
+
+        try {
+            val base64Data = Base64.encodeToString(pcmChunk, Base64.NO_WRAP)
+            val msg = JSONObject().apply {
+                val realtimeInput = JSONObject().apply {
+                    val mediaChunks = JSONArray().apply {
+                        val chunk = JSONObject().apply {
+                            put("mimeType", "audio/pcm;rate=16000")
+                            put("data", base64Data)
+                        }
+                        put(chunk)
                     }
-                    put(chunk)
+                    put("mediaChunks", mediaChunks)
                 }
-                put("mediaChunks", mediaChunks)
+                put("realtimeInput", realtimeInput)
             }
-            put("realtimeInput", realtimeInput)
+            ws.send(msg.toString())
+        } catch (e: Exception) {
+            MaxVoiceLogger.w("Failed to send audio chunk: ${e.message}")
         }
-        ws.send(msg.toString())
     }
 
     private fun sendSetupHandshake(ws: WebSocket) {
+        MaxVoiceLogger.i("Sending Gemini Live setup handshake with model: $LIVE_MODEL")
         val setupMsg = JSONObject().apply {
             val setup = JSONObject().apply {
                 put("model", LIVE_MODEL)
@@ -269,50 +360,60 @@ class GeminiLiveManager(
         ws.send(setupMsg.toString())
     }
 
-    private fun createWebSocketListener(): WebSocketListener {
+    private fun createWebSocketListener(onConnectedCallback: (() -> Unit)?): WebSocketListener {
         return object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 reconnectAttempts = 0
+                MaxVoiceLogger.i("Gemini Live WebSocket opened successfully")
                 updateDebug(connection = "Connected (Gemini Live)")
                 sendSetupHandshake(webSocket)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 scope.launch {
-                    handleServerMessage(text)
+                    handleServerMessage(text, onConnectedCallback)
                 }
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                MaxVoiceLogger.d("WebSocket closing: $code / $reason")
                 webSocket.close(1000, null)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                MaxVoiceLogger.i("WebSocket closed: $code / $reason")
                 this@GeminiLiveManager.webSocket = null
+                isHandshakeComplete = false
                 updateDebug(connection = "Closed ($reason)")
-                if (_assistantState.value != AssistantState.IDLE) {
+                if (!isUserExplicitlyStopped && _assistantState.value != AssistantState.IDLE) {
                     scheduleReconnect()
                 }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                MaxVoiceLogger.e("WebSocket failure: ${t.message}", t)
                 this@GeminiLiveManager.webSocket = null
+                isHandshakeComplete = false
                 val err = t.localizedMessage ?: "Connection error"
                 updateDebug(connection = "Failed", err = err)
-                scheduleReconnect()
+                if (!isUserExplicitlyStopped) {
+                    scheduleReconnect()
+                }
             }
         }
     }
 
-    private suspend fun handleServerMessage(jsonText: String) {
+    private suspend fun handleServerMessage(jsonText: String, onConnectedCallback: (() -> Unit)?) {
         try {
             val json = JSONObject(jsonText)
 
             // 1. Check for setupComplete
             if (json.has("setupComplete")) {
+                isHandshakeComplete = true
+                MaxVoiceLogger.i("Gemini Live setupComplete handshake received. Session is LIVE.")
                 withContext(Dispatchers.Main) {
-                    _statusMessage.value = "MAX Connected! Ready to speak."
                     updateDebug(connection = "Live Ready")
+                    onConnectedCallback?.invoke()
                 }
                 return
             }
@@ -337,6 +438,7 @@ class GeminiLiveManager(
                             argsMap[k] = argsJson.get(k)
                         }
 
+                        MaxVoiceLogger.i("Tool call received from Gemini Live: $name")
                         updateDebug(lastTool = name)
 
                         val toolCall = ToolCall(callId, name, argsMap)
@@ -357,9 +459,10 @@ class GeminiLiveManager(
             if (json.has("serverContent")) {
                 val serverContent = json.getJSONObject("serverContent")
 
+                // Gemini signaled barge-in / interruption
                 if (serverContent.optBoolean("interrupted", false)) {
-                    audioOutputManager.stopPlayback()
-                    _assistantState.value = AssistantState.LISTENING
+                    MaxVoiceLogger.i("Server signaled interruption event")
+                    handleUserBargeIn()
                     return
                 }
 
@@ -387,48 +490,61 @@ class GeminiLiveManager(
                 }
 
                 if (serverContent.optBoolean("turnComplete", false)) {
-                    delay(300)
-                    if (!audioOutputManager.isPlaying.value) {
+                    delay(400)
+                    if (!audioOutputManager.isPlaying.value && _assistantState.value == AssistantState.SPEAKING) {
                         _assistantState.value = AssistantState.IDLE
-                        _statusMessage.value = "MAX is listening. Say 'MAX' or tap orb."
+                        val isGf = wallpaperThemeManager.personality.value == AssistantPersonality.GIRLFRIEND_MODE
+                        _statusMessage.value = if (isGf) "Aapke saath hoon babu... ❤️" else "Tap orb to speak"
                         updateDebug(state = "IDLE")
                     }
                 }
             }
         } catch (e: Exception) {
+            MaxVoiceLogger.e("Error parsing Gemini Live message: ${e.message}", e)
             updateDebug(err = "JSON Parse: ${e.localizedMessage}")
         }
     }
 
     private fun sendToolResponse(callId: String, resultText: String) {
         val ws = webSocket ?: return
-        val toolResponseMsg = JSONObject().apply {
-            val toolResponse = JSONObject().apply {
-                val functionResponses = JSONArray().apply {
-                    val resp = JSONObject().apply {
-                        put("id", callId)
-                        val responseContent = JSONObject().apply {
-                            val output = JSONObject().apply {
-                                put("result", resultText)
+        try {
+            val toolResponseMsg = JSONObject().apply {
+                val toolResponse = JSONObject().apply {
+                    val functionResponses = JSONArray().apply {
+                        val resp = JSONObject().apply {
+                            put("id", callId)
+                            val responseContent = JSONObject().apply {
+                                val output = JSONObject().apply {
+                                    put("result", resultText)
+                                }
+                                put("output", output)
                             }
-                            put("output", output)
+                            put("response", responseContent)
                         }
-                        put("response", responseContent)
+                        put(resp)
                     }
-                    put(resp)
+                    put("functionResponses", functionResponses)
                 }
-                put("functionResponses", functionResponses)
+                put("toolResponse", toolResponse)
             }
-            put("toolResponse", toolResponse)
+            ws.send(toolResponseMsg.toString())
+            MaxVoiceLogger.d("Tool response sent for callId: $callId")
+        } catch (e: Exception) {
+            MaxVoiceLogger.e("Failed to send tool response: ${e.message}", e)
         }
-        ws.send(toolResponseMsg.toString())
     }
 
+    /**
+     * Requirement 12: Safely reconnects with exponential backoff without creating duplicate sessions.
+     */
     private fun scheduleReconnect() {
+        if (isUserExplicitlyStopped) return
+
         if (reconnectAttempts >= 5) {
             _assistantState.value = AssistantState.OFFLINE
-            _statusMessage.value = "Internet connection issue. Offline local features available."
-            updateDebug(state = "OFFLINE", connection = "Offline fallback active")
+            _statusMessage.value = "Connection lost. Tap Orb to reconnect."
+            updateDebug(state = "OFFLINE", connection = "Max retries reached")
+            MaxVoiceLogger.w("Max reconnection attempts (5) reached")
             return
         }
 
@@ -436,8 +552,10 @@ class GeminiLiveManager(
         reconnectJob = scope.launch {
             val backoffMs = (1000L * (1 shl reconnectAttempts)).coerceAtMost(16000L)
             reconnectAttempts++
-            _statusMessage.value = "Reconnecting in ${backoffMs / 1000}s..."
+            _assistantState.value = AssistantState.CONNECTING
+            _statusMessage.value = "Reconnecting (${backoffMs / 1000}s)..."
             updateDebug(connection = "Backoff ${backoffMs / 1000}s (Attempt $reconnectAttempts)")
+            MaxVoiceLogger.i("Scheduling reconnect in ${backoffMs}ms (Attempt $reconnectAttempts)")
             delay(backoffMs)
             startSession()
         }
@@ -465,5 +583,6 @@ class GeminiLiveManager(
     fun release() {
         stopSession()
         audioOutputManager.release()
+        audioInputManager.stopRecording()
     }
 }

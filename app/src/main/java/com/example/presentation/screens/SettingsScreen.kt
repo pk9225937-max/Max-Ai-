@@ -32,12 +32,14 @@ import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.BatteryAlert
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Hearing
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
@@ -124,6 +126,9 @@ fun SettingsScreen(
     var isKeyConfiguredState by remember {
         mutableStateOf(sessionManager.geminiLiveManager.isApiKeyConfigured())
     }
+
+    var micTestRunning by remember { mutableStateOf(false) }
+    var micTestResult by remember { mutableStateOf<com.example.audio.MicrophoneTestResult?>(null) }
 
     // Photo picker launcher for user's own photos
     val photoPickerLauncher = rememberLauncherForActivityResult(
@@ -587,7 +592,119 @@ fun SettingsScreen(
                 }
             }
 
-            // 5. AI ENGINE & GEMINI LIVE CONFIG
+            // 5. MICROPHONE DIAGNOSTICS & HARDWARE TEST (Requirement 28)
+            item {
+                SectionHeader("MICROPHONE HARDWARE DIAGNOSTICS")
+                GlassPanel(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = 16.dp
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Native Audio Pipeline", color = TextPrimary, fontWeight = FontWeight.SemiBold)
+                                Text("AudioRecord 16kHz PCM (No Google SpeechRecognizer dependency)", color = TextSecondary, fontSize = 12.sp)
+                            }
+                            Text(
+                                text = "Native AudioRecord",
+                                color = EmeraldGreen,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp
+                            )
+                        }
+
+                        HorizontalDivider(color = DarkSurface)
+
+                        Button(
+                            onClick = {
+                                scope.launch {
+                                    micTestRunning = true
+                                    micTestResult = sessionManager.testMicrophone()
+                                    micTestRunning = false
+                                }
+                            },
+                            enabled = !micTestRunning,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = NeonCyan)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Mic,
+                                contentDescription = null,
+                                tint = Color.Black,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = if (micTestRunning) "Testing Microphone Hardware..." else "Test Microphone Now",
+                                color = Color.Black,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+
+                        micTestResult?.let { result ->
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(if (result.success) EmeraldGreen.copy(alpha = 0.15f) else AlertRed.copy(alpha = 0.15f))
+                                    .border(
+                                        1.dp,
+                                        if (result.success) EmeraldGreen.copy(alpha = 0.5f) else AlertRed.copy(alpha = 0.5f),
+                                        RoundedCornerShape(12.dp)
+                                    )
+                                    .padding(12.dp)
+                            ) {
+                                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(
+                                            imageVector = if (result.success) Icons.Default.Check else Icons.Default.Close,
+                                            contentDescription = null,
+                                            tint = if (result.success) EmeraldGreen else AlertRed,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = if (result.success) "Microphone Test: PASSED" else "Microphone Test: FAILED",
+                                            color = if (result.success) EmeraldGreen else AlertRed,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 13.sp
+                                        )
+                                    }
+                                    Text(
+                                        text = result.message,
+                                        color = TextPrimary,
+                                        fontSize = 12.sp,
+                                        lineHeight = 16.sp
+                                    )
+                                    if (result.success) {
+                                        Text(
+                                            text = "PCM Volume Level: ${result.peakAmplitudePercentage}% | Captured: ${result.bytesCaptured} bytes",
+                                            color = NeonCyan,
+                                            fontWeight = FontWeight.SemiBold,
+                                            fontSize = 12.sp
+                                        )
+                                    } else {
+                                        OutlinedButton(
+                                            onClick = onNavigateToPermissions,
+                                            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                            shape = RoundedCornerShape(8.dp)
+                                        ) {
+                                            Text("Open Permissions Screen", fontSize = 12.sp)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 6. AI ENGINE & GEMINI LIVE CONFIG
             item {
                 SectionHeader("AI ENGINE & GEMINI LIVE")
                 GlassPanel(

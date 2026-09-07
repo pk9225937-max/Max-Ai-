@@ -30,6 +30,7 @@ class AudioOutputManager(private val context: Context) {
         context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     }
 
+    private val trackLock = Any()
     private var audioTrack: AudioTrack? = null
     private val audioQueue = Channel<ByteArray>(Channel.UNLIMITED)
     private var playbackJob: Job? = null
@@ -41,74 +42,97 @@ class AudioOutputManager(private val context: Context) {
     val outputAmplitude: StateFlow<Float> = _outputAmplitude.asStateFlow()
 
     fun initPlayer(scope: CoroutineScope) {
-        if (audioTrack != null) return
+        synchronized(trackLock) {
+            if (audioTrack != null) return
 
-        val minBufferSize = AudioTrack.getMinBufferSize(
-            OUTPUT_SAMPLE_RATE,
-            CHANNEL_CONFIG,
-            AUDIO_FORMAT
-        )
-        val bufferSize = maxOf(minBufferSize * 2, 4096)
+            val minBufferSize = AudioTrack.getMinBufferSize(
+                OUTPUT_SAMPLE_RATE,
+                CHANNEL_CONFIG,
+                AUDIO_FORMAT
+            )
+            val bufferSize = maxOf(minBufferSize * 2, 4096)
 
-        val attributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_ASSISTANT)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-            .build()
+            val attributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
 
-        val format = AudioFormat.Builder()
-            .setSampleRate(OUTPUT_SAMPLE_RATE)
-            .setChannelMask(CHANNEL_CONFIG)
-            .setEncoding(AUDIO_FORMAT)
-            .build()
+            val format = AudioFormat.Builder()
+                .setSampleRate(OUTPUT_SAMPLE_RATE)
+                .setChannelMask(CHANNEL_CONFIG)
+                .setEncoding(AUDIO_FORMAT)
+                .build()
 
-        audioTrack = AudioTrack(
-            attributes,
-            format,
-            bufferSize,
-            AudioTrack.MODE_STREAM,
-            AudioManager.AUDIO_SESSION_ID_GENERATE
-        )
-
-        try {
-            audioTrack?.play()
-        } catch (e: Exception) {
-            // Track state initialization fallback
-        }
-
-        playbackJob = scope.launch(Dispatchers.IO) {
-            for (chunk in audioQueue) {
-                if (!isActive) break
-                _isPlaying.value = true
-                val rms = calculateRMS(chunk, chunk.size)
-                _outputAmplitude.value = (rms / 32767f).coerceIn(0f, 1f)
-
-                try {
-                    audioTrack?.write(chunk, 0, chunk.size)
-                } catch (e: Exception) {
-                    break
-                }
+            try {
+                audioTrack = AudioTrack(
+                    attributes,
+                    format,
+                    bufferSize,
+                    AudioTrack.MODE_STREAM,
+                    AudioManager.AUDIO_SESSION_ID_GENERATE
+                )
+                audioTrack?.play()
+                MaxVoiceLogger.i("AudioTrack initialized at ${OUTPUT_SAMPLE_RATE}Hz mono PCM")
+            } catch (e: Exception) {
+                MaxVoiceLogger.e("AudioTrack initialization failed: ${e.message}", e)
             }
-            _isPlaying.value = false
-            _outputAmplitude.value = 0f
+
+            playbackJob = scope.launch(Dispatchers.IO) {
+                for (chunk in audioQueue) {
+                    if (!isActive) break
+                    _isPlaying.value = true
+                    val rms = calculateRMS(chunk, chunk.size)
+                    _outputAmplitude.value = (rms / 32767f).coerceIn(0f, 1f)
+
+                    try {
+                        val track = audioTrack
+                        if (track != null && track.state == AudioTrack.STATE_INITIALIZED) {
+                            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                                track.play()
+                            }
+                            track.write(chunk, 0, chunk.size)
+                        }
+                    } catch (e: Exception) {
+                        MaxVoiceLogger.w("AudioTrack write error: ${e.message}")
+                        break
+                    }
+                }
+                _isPlaying.value = false
+                _outputAmplitude.value = 0f
+            }
         }
     }
 
     fun enqueueAudio(chunk: ByteArray) {
         requestAudioFocus()
+        MaxVoiceLogger.d("Enqueuing ${chunk.size} bytes of native audio for playback")
         audioQueue.trySend(chunk)
     }
 
+    /**
+     * Requirement 9: Stop playback immediately upon user interruption or barge-in.
+     */
     fun stopPlayback() {
-        // Clear pending chunks
+        // Drain any unplayed audio chunks
+        var drainedCount = 0
         while (audioQueue.tryReceive().isSuccess) {
-            // Drain queue
+            drainedCount++
         }
+        if (drainedCount > 0) {
+            MaxVoiceLogger.d("Drained $drainedCount pending audio chunks for interruption")
+        }
+
         try {
-            audioTrack?.pause()
-            audioTrack?.flush()
+            audioTrack?.let { track ->
+                if (track.state == AudioTrack.STATE_INITIALIZED) {
+                    track.pause()
+                    track.flush()
+                }
+            }
         } catch (e: Exception) {
-            // Ignored
+            MaxVoiceLogger.w("Exception stopping/flushing AudioTrack: ${e.message}")
         }
+
         _isPlaying.value = false
         _outputAmplitude.value = 0f
         abandonAudioFocus()
@@ -118,41 +142,52 @@ class AudioOutputManager(private val context: Context) {
         stopPlayback()
         playbackJob?.cancel()
         playbackJob = null
-        try {
-            audioTrack?.stop()
-            audioTrack?.release()
-        } catch (e: Exception) {
-            // Ignored
-        } finally {
-            audioTrack = null
+        synchronized(trackLock) {
+            try {
+                audioTrack?.stop()
+                audioTrack?.release()
+                MaxVoiceLogger.d("AudioTrack released")
+            } catch (e: Exception) {
+                MaxVoiceLogger.w("Exception releasing AudioTrack: ${e.message}")
+            } finally {
+                audioTrack = null
+            }
         }
     }
 
     private fun requestAudioFocus() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build()
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    .build()
+                audioManager?.requestAudioFocus(focusRequest)
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager?.requestAudioFocus(
+                    null,
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
                 )
-                .build()
-            audioManager?.requestAudioFocus(focusRequest)
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager?.requestAudioFocus(
-                null,
-                AudioManager.STREAM_MUSIC,
-                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
-            )
+            }
+        } catch (e: Exception) {
+            MaxVoiceLogger.w("Failed to request audio focus: ${e.message}")
         }
     }
 
     private fun abandonAudioFocus() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            @Suppress("DEPRECATION")
-            audioManager?.abandonAudioFocus(null)
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                @Suppress("DEPRECATION")
+                audioManager?.abandonAudioFocus(null)
+            }
+        } catch (e: Exception) {
+            // Ignore
         }
     }
 

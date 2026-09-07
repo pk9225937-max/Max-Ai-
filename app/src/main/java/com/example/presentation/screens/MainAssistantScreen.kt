@@ -37,6 +37,7 @@ import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
@@ -44,6 +45,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -114,6 +116,7 @@ fun MainAssistantScreen(
 
     var showCommandsSheet by remember { mutableStateOf(false) }
     var isBgRunning by remember { mutableStateOf(BackgroundAudioService.isServiceRunning) }
+    var showMicErrorDialog by remember { mutableStateOf(false) }
 
     val isGirlfriend = personality == AssistantPersonality.GIRLFRIEND_MODE
 
@@ -402,28 +405,102 @@ fun MainAssistantScreen(
                 }
 
                 val isKeyConfigured = sessionManager.geminiLiveManager.isApiKeyConfigured()
-                if (assistantState == AssistantState.ERROR && !isKeyConfigured) {
+                val isMicError = assistantState == AssistantState.ERROR &&
+                        (statusMessage.contains("Microphone", ignoreCase = true) || !permissionState.recordAudio)
+
+                if (assistantState == AssistantState.ERROR) {
                     Spacer(modifier = Modifier.height(12.dp))
-                    Button(
-                        onClick = onNavigateToSettings,
-                        colors = ButtonDefaults.buttonColors(containerColor = NeonCyan),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Key,
-                            contentDescription = null,
-                            tint = Color.Black,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "Enter Gemini API Key",
-                            color = Color.Black,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp
-                        )
+                    if (!isKeyConfigured) {
+                        Button(
+                            onClick = onNavigateToSettings,
+                            colors = ButtonDefaults.buttonColors(containerColor = NeonCyan),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Key,
+                                contentDescription = null,
+                                tint = Color.Black,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Enter Gemini API Key",
+                                color = Color.Black,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp
+                            )
+                        }
+                    } else if (isMicError) {
+                        Button(
+                            onClick = { showMicErrorDialog = true },
+                            colors = ButtonDefaults.buttonColors(containerColor = AlertRed),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.MicOff,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Microphone Unavailable",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp
+                            )
+                        }
                     }
                 }
+            }
+
+            // Requirement 29: Clear error dialog for microphone unavailability
+            if (showMicErrorDialog) {
+                AlertDialog(
+                    onDismissRequest = { showMicErrorDialog = false },
+                    title = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.MicOff,
+                                contentDescription = null,
+                                tint = AlertRed,
+                                modifier = Modifier.size(24.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Microphone Unavailable",
+                                color = TextPrimary,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 18.sp
+                            )
+                        }
+                    },
+                    text = {
+                        Text(
+                            text = "Microphone unavailable. Please check microphone permission and make sure another app is not using the microphone.",
+                            color = TextSecondary,
+                            fontSize = 14.sp,
+                            lineHeight = 20.sp
+                        )
+                    },
+                    confirmButton = {
+                        Button(
+                            onClick = {
+                                showMicErrorDialog = false
+                                onNavigateToPermissions()
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = NeonCyan)
+                        ) {
+                            Text("Open Permissions", color = Color.Black, fontWeight = FontWeight.Bold)
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showMicErrorDialog = false }) {
+                            Text("Dismiss", color = TextSecondary)
+                        }
+                    },
+                    containerColor = DarkSurface
+                )
             }
 
             // BOTTOM CONTROLS

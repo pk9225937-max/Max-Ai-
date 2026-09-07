@@ -3,6 +3,7 @@ package com.example.ai
 import android.content.Context
 import com.example.audio.AudioInputManager
 import com.example.audio.AudioOutputManager
+import com.example.audio.MicrophoneTestResult
 import com.example.audio.WakeWordManager
 import com.example.data.local.AppDatabase
 import com.example.data.repository.ContactRepository
@@ -87,6 +88,10 @@ class LiveSessionManager(private val context: Context) {
 
     fun onOrbClicked() {
         geminiLiveManager.toggleVoiceInteraction()
+    }
+
+    suspend fun testMicrophone(): MicrophoneTestResult {
+        return audioInputManager.testMicrophone()
     }
 
     fun confirmPendingAction(confirmed: Boolean) {
